@@ -1,0 +1,115 @@
+From 40c6c82f65576c3f670f2dcc24068d61ccbc1313 Mon Sep 17 00:00:00 2001
+From: SixVolts <rigel@sixvolts.org>
+Date: Sat, 17 Oct 2026 00:00:00 +0000
+Subject: [PATCH 01/01] rdna2: FA gate fixes - decode-band q_h2 launch arg, bf16 f16 scratch sizing, guard tail
+
+r81 test-backend-ops gates on RDNA2 (gfx1030, Radeon Pro V620): FLASH_ATTN_EXT
+aborted with an illegal memory access and MUL_MAT was blocked behind it.
+Root cause is three separate bugs, fixed here:
+
+1. fattn.cu (ggml_cuda_flash_attn_ext_get_alloc_size, TILE branch): for bf16
+   KV the f16 conversion scratch was not reserved on gfx1030 (V_DOT2_F32_BF16
+   is gfx11xx/12xx only, so the tile kernel converts the whole cache to f16
+   and reads the staged buffer).  The converter wrote past the node's
+   allocation -> sentinel clobber and an illegal memory access (hsk=40/192
+   bf16).  Map FATTN_KV_NATIVE_BF16 to the f16 reservation so the launcher
+   and the allocator agree on whether the scratch exists.
+
+2. fattn-common.cuh (ggml_cuda_flash_attn_ext_get_f16_extra_data): the
+   ncols2 > 1 tile branch loads the last KV tile without OOB checks, so for
+   a KV length that is not a multiple of nbatch_fa the read can overrun the
+   exact-size converted buffer by up to nbatch_fa - 1 rows.  Reserve a
+   511-row guard tail after each converted operand (nbatch_fa is capped at
+   256 by the kernel config table).
+
+3. fattn-tile.cuh (launch_fattn_tile_switch_ncols1): the decode/verify band
+   branch (Q->ne[1] <= 8) omitted the q_h2 argument (default false) while
+   the other six launch sites pass it.  The wide RDNA2 kernels (DKQ <= 256,
+   ncols >= 16, GGML_CUDA_FATTN_TILE_Q_GLOBAL) read Q from that global half2
+   buffer, so gqa-16 decode shapes (e.g. hsk=192, nr23=[16,1], n_q <= 8)
+   got a null pointer and faulted near 0x1000.  Pass the same q_h2
+   condition as the other sites.
+
+Validation (ROCm 7.2.4, dual build gfx1030;gfx1100):
+- V620 (gfx1030): FLASH_ATTN_EXT 6389/6389, MUL_MAT 2444/2444
+- 7900 XTX (gfx1100): FLASH_ATTN_EXT 6389/6389, MUL_MAT 2444/2444
+- repro before the fix: test-backend-ops -o FLASH_ATTN_EXT -p
+  'hsk=192,hsv=128.*nr23=[16,1].*kv=512,.*type_K=bf16' -> illegal access;
+  the same run passes after it.
+All changes are compile- or runtime-gated to RDNA2 (GGML_CUDA_CC_IS_RDNA2 /
+GGML_CUDA_FATTN_TILE_Q_GLOBAL) or sit on the bf16->f16 staging path that
+only gfx1030 takes for the tile kernel; other devices are unchanged.
+---
+ ggml/src/ggml-cuda/fattn-common.cuh |   15 +++++++++++++++
+ ggml/src/ggml-cuda/fattn-tile.cuh   |    7 ++++++-
+ ggml/src/ggml-cuda/fattn.cu         |   11 +++++++++--
+ 3 files changed, 30 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 13c5caf48..28e6c01e9 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -131,6 +131,21 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
+         }
+     }
+ 
++    // The ncols2 > 1 tile branch loads the KV tiles without out-of-bounds checks (the checked tail
++    // iteration doubled the code and spilled registers on gfx1030), so the last tile reads up to
++    // nbatch_fa (a 9-bit config field, max 511) rows past the last K/V row.  For the staged F16
++    // cache that slack exists in the KV cache allocation, but the converted buffers above are exact
++    // size and sit at the very end of the node's allocation, so a large-batch case can read past
++    // the buffer into the next allocation (sentinel clobber / illegal memory access on gfx1030).
++    // Reserve a guard tail of max-row-count for each operand.
++    constexpr int64_t guard_rows = 511;
++    if (need_f16_K && K->type != GGML_TYPE_F16) {
++        data.end += guard_rows*K->ne[0]*ggml_type_size(GGML_TYPE_F16);
++    }
++    if (need_f16_V && V->type != GGML_TYPE_F16 && !V_is_K_view) {
++        data.end += guard_rows*V->ne[0]*ggml_type_size(GGML_TYPE_F16);
++    }
++
+     return data;
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index 1a87beb4d..f660df0b8 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -1772,9 +1772,14 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+         const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+         const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+         fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, type_KV>;
++        // The q_h2 argument must mirror the kernel-side q_global condition
++        // (GGML_CUDA_FATTN_TILE_Q_GLOBAL && DKQ <= 256 && ncols >= 16): the wide RDNA2 kernels
++        // read Q from the Q_h2 global half2 buffer, and omitting the argument here (default
++        // false) passed a null pointer to the kernel -> illegal memory access (decode band).
+         launch_fattn<DV, cols_per_block/ncols2, ncols2>
+             (ctx, dst, fattn_kernel, nwarps, nbytes_shared, nbatch_fa,
+-            need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size);
++            need_f16_K, need_f16_V, false, false, kv_native_tile, warp_size, false,
++            /*q_h2*/ GGML_CUDA_CC_IS_RDNA2(cc) && fast_fp16_available(cc) && DKQ <= 256 && cols_per_block >= 16);
+         return;
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 331db01c3..5be606f74 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -860,8 +860,15 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
+                     bf16_mma_hardware_available(ggml_cuda_info().devices[device].cc)) {
+                 tile_type = GGML_TYPE_BF16;
+             } else {
+-                // FATTN_KV_NATIVE_NONE maps to F16, i.e. the staged type.
+-                tile_type = ggml_cuda_fattn_native_ggml_type(ggml_cuda_fattn_tile_kv_native_type(K, V));
++                // FATTN_KV_NATIVE_NONE maps to F16, i.e. the staged type.  FATTN_KV_NATIVE_BF16 is
++                // staged to F16 here as well: the native BF16 tile is only selected by the first branch
++                // above (bf16_mma_hardware_available).  On hardware without native BF16 tensor cores
++                // (e.g. RDNA2/gfx1030) the tile kernel is the F16 instantiation and the launcher converts
++                // the bf16 K/V to F16, so the scratch must be reserved (otherwise the conversion writes
++                // past the node's allocation into the neighbouring buffer).
++                const int tile_native = ggml_cuda_fattn_tile_kv_native_type(K, V);
++                tile_type = (tile_native == FATTN_KV_NATIVE_BF16) ? GGML_TYPE_F16
++                                                                  : ggml_cuda_fattn_native_ggml_type(tile_native);
+             }
+             need_f16_K = K->type != tile_type;
+             need_f16_V = V->type != tile_type;

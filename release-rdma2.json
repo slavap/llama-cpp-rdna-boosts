@@ -1,0 +1,10 @@
+{
+  "release": "rdna2-fa-r1",
+  "base": "v12-097cf33d9-r82",
+  "base_tree": "dc48b4a983cba245f71e60ce8825abedac8e2a45",
+  "n_blocks": 1,
+  "tree": "65596362cbcc7bec1bfa228d47010f8273ef21d7",
+  "patches": {
+    "0000-rdna2-fa-gate-fixes.patch": "b8ffa8a16a12ebcbce65345190a5f926f4e31c1fd066af17e66b76957f33771b"
+  }
+}
